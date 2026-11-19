@@ -17,6 +17,7 @@ package keychain
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
 )
@@ -67,6 +68,12 @@ func GetGenericPassword(service string, account string) ([]byte, error) {
 	var resultsRef C.CFTypeRef
 	errCode := C.SecItemCopyMatching(queryCf, &resultsRef)
 	if errCode != 0 {
+		// macOS may not expose the localized error string through
+		// CFStringGetCStringPtr for errSecItemNotFound. Keep the provider's
+		// public error stable across macOS releases.
+		if int(errCode) == -25300 {
+			return nil, errors.New("The specified item could not be found in the keychain.")
+		}
 		errorMessageCf := C.SecCopyErrorMessageString(errCode, nil)
 		defer release(C.CFTypeRef(errorMessageCf))
 		// Whether or not this function returns a valid pointer or NULL depends on many factors, ...
@@ -78,7 +85,7 @@ func GetGenericPassword(service string, account string) ([]byte, error) {
 			C.CFShow(C.CFTypeRef(errorMessageCf))
 			message = fmt.Sprintf("An unknown error occurred : %d", int(errCode))
 		}
-		return nil, fmt.Errorf(message)
+		return nil, errors.New(message)
 	}
 
 	defer release(C.CFTypeRef(resultsRef))
