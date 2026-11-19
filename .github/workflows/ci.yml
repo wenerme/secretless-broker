@@ -8,6 +8,9 @@ on:
   # Run this on pushes to any branch
   push:
 
+  # Allow manual verification from the fork's develop branch.
+  workflow_dispatch:
+
 jobs:
   unit_test:
     name: Unit Tests
