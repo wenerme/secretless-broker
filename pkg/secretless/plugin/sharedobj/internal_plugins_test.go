@@ -89,7 +89,8 @@ func TestGetInternalPlugins(t *testing.T) {
 		assert.NotNil(t, internalPlugins.TCPPlugins())
 
 		if internalPlugins.HTTPPlugins() != nil {
-			assert.Equal(t, 4, len(internalPlugins.HTTPPlugins()))
+			assert.Equal(t, 5, len(internalPlugins.HTTPPlugins()))
+			assert.NotNil(t, internalPlugins.HTTPPlugins()["tencent_tc3"])
 		}
 
 		if internalPlugins.TCPPlugins() != nil {
