@@ -43,6 +43,7 @@ the first edit, and the submodule is initialized.
 | Built-in HTTP connectors | `internal/plugin/connectors/http/<name>/` | Protocol-specific request decoration |
 | Built-in TCP connectors | `internal/plugin/connectors/tcp/<name>/` | Protocol-specific connection/auth handshake |
 | Credential providers | `internal/providers/<name>/` | Read credential values from a source |
+| Telemetry (OTel) | `internal/telemetry/` | Standard `OTEL_*` env bootstrap, shared metrics, tracer/meter helpers |
 | Plugin registry | `pkg/secretless/plugin/sharedobj/internal_plugins.go` | Make built-in connectors discoverable |
 | Connector/provider tests | `internal/.../*_test.go`, `test/` | Unit, integration, and platform tests |
 
@@ -176,12 +177,17 @@ integration, platform, live-provider, and live-upstream tests.
 
 ## CI and Git workflow
 
-`.github/workflows/ci.yml` runs on pushes and supports manual dispatch. The
-required jobs are:
+`.github/workflows/ci.yml` runs on pushes, pull requests to `develop`, daily
+schedule, and manual dispatch. The jobs are:
 
 - Unit Tests on `ubuntu-latest`;
 - Linux build and integration tests on `ubuntu-latest`;
-- macOS Keychain tests on `macos-15-intel`.
+- macOS Keychain tests on `macos-15-intel`;
+- Build and Publish Container Image (`publish_image`) on `ubuntu-latest` after
+  `unit_test` and `build_and_test` pass, building multi-arch
+  (`linux/amd64`, `linux/arm64`) `secretless-broker` images via Buildx and
+  pushing to `ghcr.io/<owner>/<repo>` on `develop`, `v*` tags, or manual
+  dispatch (build-only on pull requests).
 
 Before pushing:
 

@@ -5,23 +5,36 @@ on:
   schedule:
     - cron: '0 0 * * *'
 
-  # Run this on pushes to any branch
+  # Run on branch and tag pushes
   push:
 
-  # Allow manual verification from the fork's develop branch.
+  # Validate pull requests targeting the default branch
+  pull_request:
+    branches:
+      - develop
+
+  # Allow manual verification and image publishing
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit_test:
     name: Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         with:
-          go-version: '~1.27.3'
+          go-version-file: go.mod
+          cache: true
       - name: Generate Version
         run: grep -m 1 -P "## \[\d+\.\d+\.\d+\] -" CHANGELOG.md | grep -o -P "\d+\.\d+\.\d+" > VERSION
       - name: go mod tidy
@@ -33,12 +46,13 @@ jobs:
     name: Build and Functional Tests on Linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - uses: actions/setup-go@v3
+      - uses: actions/setup-go@v5
         with:
-          go-version: '~1.27.3'
+          go-version-file: go.mod
+          cache: true
       - name: Generate Version
         run: grep -m 1 -P "## \[\d+\.\d+\.\d+\] -" CHANGELOG.md | grep -o -P "\d+\.\d+\.\d+" > VERSION
       - name: go mod tidy
@@ -54,24 +68,107 @@ jobs:
     name: Functional Tests on macOS
     runs-on: macos-15-intel
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
-      # Cache go module dependencies based on go.sum to improve workflow execution time.
-      - uses: actions/cache@v4
+      - uses: actions/setup-go@v5
         with:
-          path: ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-      # Install go1.22
-      - uses: actions/setup-go@v3
-        with:
-          go-version: '~1.27.3'
-      # Get go version
+          go-version-file: go.mod
+          cache: true
       - run: go version
-      # Download go modules
       - run: go mod download
       - run: go mod tidy -compat=$(grep -E "^go\s\d+\.\d+" go.mod | grep -oE "\d+\.\d+")
-      # Run keychain tests
       - run: cd test/providers/keychain && ./start && ./test && ./stop
+
+  publish_image:
+    name: Build and Publish Container Image
+    runs-on: ubuntu-latest
+    needs: [unit_test, build_and_test]
+    if: >-
+      github.event_name != 'schedule' &&
+      (github.event_name == 'pull_request' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.ref == 'refs/heads/develop' ||
+       startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      REGISTRY: ghcr.io
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Prepare build metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build_ca_certificate
+          image_name="$(printf '%s' "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE_NAME=${image_name}" >> "${GITHUB_ENV}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF#refs/tags/v}"
+          else
+            version="$(grep -m 1 -P "## \[\d+\.\d+\.\d+\] -" CHANGELOG.md | grep -o -P "\d+\.\d+\.\d+")"
+          fi
+          echo "VERSION=${version}" >> "${GITHUB_ENV}"
+          echo "SHORT_SHA=$(git rev-parse --short HEAD)" >> "${GITHUB_ENV}"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/develop' || (startsWith(github.ref, 'refs/tags/v') && !contains(github.ref, '-')) }}
+
+      - name: Build and push multi-arch image
+        id: build_and_push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: secretless-broker
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            TAG=${{ env.SHORT_SHA }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          sbom: ${{ github.event_name != 'pull_request' }}
+          provenance: ${{ github.event_name != 'pull_request' && 'mode=max' || 'false' }}
+
+      - name: Generate build provenance attestation
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build_and_push.outputs.digest }}
+          push-to-registry: true

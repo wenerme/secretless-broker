@@ -1,6 +1,8 @@
-FROM golang:1.27-trixie AS secretless-builder
+FROM golang:1.27-alpine AS secretless-builder
 LABEL maintainer="CyberArk Software Ltd."
 LABEL builder="secretless-builder"
+
+RUN apk add --no-cache build-base ca-certificates
 
 # On CyberArk dev laptops, golang module dependencies are downloaded with a
 # corporate proxy in the middle. For these connections to succeed we need to
@@ -15,15 +17,19 @@ RUN update-ca-certificates
 
 WORKDIR /secretless
 
-# TODO: Expand this with build args when we support other arches
-ENV GOOS=linux \
-    GOARCH=amd64 \
-    CGO_ENABLED=1
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG CGO_ENABLED=1
+
+ENV GOOS=${TARGETOS} \
+    GOARCH=${TARGETARCH} \
+    CGO_ENABLED=${CGO_ENABLED}
 
 COPY go.mod go.sum /secretless/
 COPY third_party/ /secretless/third_party
 
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 # secretless source files
 COPY ./cmd /secretless/cmd
@@ -32,20 +38,30 @@ COPY ./pkg /secretless/pkg
 COPY ./resource-definitions /secretless/resource-definitions
 
 ARG TAG="dev"
+ARG VERSION=""
 
-# The `Tag` override is there to provide the git commit information in the
-# final binary. See `Static long version tags` in the `Building` section
-# of `CONTRIBUTING.md` for more information.
-RUN go build -ldflags="-X github.com/cyberark/secretless-broker/pkg/secretless.Tag=$TAG" \
-             -o dist/$GOOS/$GOARCH/secretless-broker ./cmd/secretless-broker && \
-    go build -o dist/$GOOS/$GOARCH/summon2 ./cmd/summon2
+# The `Tag` override provides git commit information in the final binary.
+# When `VERSION` is supplied (e.g. from CI/release tags), it also overrides
+# pkg/secretless.Version.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    LDFLAGS="-s -w -X github.com/cyberark/secretless-broker/pkg/secretless.Tag=${TAG}"; \
+    if [ -n "${VERSION}" ]; then \
+      LDFLAGS="${LDFLAGS} -X github.com/cyberark/secretless-broker/pkg/secretless.Version=${VERSION}"; \
+    fi; \
+    mkdir -p /out && \
+    go build -ldflags="${LDFLAGS}" -o /out/secretless-broker ./cmd/secretless-broker && \
+    go build -ldflags="-s -w" -o /out/summon2 ./cmd/summon2
 
 
 # =================== MAIN CONTAINER ===================
-FROM alpine:3.20 AS secretless-broker
+FROM alpine:3.23 AS secretless-broker
 LABEL maintainer="CyberArk Software Ltd."
+LABEL org.opencontainers.image.title="secretless-broker"
+LABEL org.opencontainers.image.description="Secretless Broker secures apps by injecting credentials into backend connections"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
 
-RUN apk add -u --no-cache shadow libc6-compat openssl && \
+RUN apk add -u --no-cache ca-certificates shadow openssl && \
     # Add Limited user
     groupadd -r secretless \
              -g 777 && \
@@ -77,8 +93,52 @@ USER secretless
 
 ENTRYPOINT [ "/usr/local/bin/secretless-broker" ]
 
-COPY --from=secretless-builder /secretless/dist/linux/amd64/secretless-broker \
-                               /secretless/dist/linux/amd64/summon2 /usr/local/bin/
+COPY --from=secretless-builder /out/secretless-broker \
+                               /out/summon2 /usr/local/bin/
+
+
+# =================== GLIBC BUILDER (REDHAT) ===================
+FROM golang:1.27-trixie AS secretless-builder-glibc
+LABEL maintainer="CyberArk Software Ltd."
+LABEL builder="secretless-builder-glibc"
+
+COPY build_ca_certificate /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
+WORKDIR /secretless
+
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+ARG CGO_ENABLED=1
+
+ENV GOOS=${TARGETOS} \
+    GOARCH=${TARGETARCH} \
+    CGO_ENABLED=${CGO_ENABLED}
+
+COPY go.mod go.sum /secretless/
+COPY third_party/ /secretless/third_party
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
+
+COPY ./cmd /secretless/cmd
+COPY ./internal /secretless/internal
+COPY ./pkg /secretless/pkg
+COPY ./resource-definitions /secretless/resource-definitions
+
+ARG TAG="dev"
+ARG VERSION=""
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    LDFLAGS="-s -w -X github.com/cyberark/secretless-broker/pkg/secretless.Tag=${TAG}"; \
+    if [ -n "${VERSION}" ]; then \
+      LDFLAGS="${LDFLAGS} -X github.com/cyberark/secretless-broker/pkg/secretless.Version=${VERSION}"; \
+    fi; \
+    mkdir -p /out && \
+    go build -ldflags="${LDFLAGS}" -o /out/secretless-broker ./cmd/secretless-broker && \
+    go build -ldflags="-s -w" -o /out/summon2 ./cmd/summon2
+
 
 # =================== MAIN CONTAINER (REDHAT) ===================
 FROM registry.access.redhat.com/ubi8/ubi AS secretless-broker-redhat
@@ -131,5 +191,5 @@ USER secretless
 
 ENTRYPOINT [ "/usr/local/bin/secretless-broker" ]
 
-COPY --from=secretless-builder /secretless/dist/linux/amd64/secretless-broker \
-                               /secretless/dist/linux/amd64/summon2 /usr/local/bin/
+COPY --from=secretless-builder-glibc /out/secretless-broker \
+                                     /out/summon2 /usr/local/bin/
