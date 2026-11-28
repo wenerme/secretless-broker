@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
-	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -197,7 +197,7 @@ func TestResolver_ErrorTelemetryDoesNotLeakRawGetIDOrProviderError(t *testing.T)
 	defer logExp.mu.Unlock()
 	require.Len(t, logExp.records, 1)
 	assert.Equal(t, "credential resolution failed", logExp.records[0].Body().AsString())
-	logExp.records[0].WalkAttributes(func(kv otellog.KeyValue) bool {
+	logExp.records[0].WalkAttributes(func(kv attribute.KeyValue) bool {
 		assert.NotContains(t, kv.Value.AsString(), "RAW-SECRET-GET-IDENTIFIER")
 		return true
 	})

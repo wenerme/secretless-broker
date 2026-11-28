@@ -203,8 +203,8 @@ func (proxy *proxyService) handleConnection(clientConn net.Conn) error {
 		outcome = "credential_error"
 		span.SetStatus(codes.Error, "credential retrieval failed")
 		telemetry.EmitEvent(ctx, otellog.SeverityError, "tcp proxy credential retrieval failed",
-			otellog.String("secretless.service.name", proxy.serviceName),
-			otellog.String("secretless.connector.id", proxy.connectorID),
+			attribute.String("secretless.service.name", proxy.serviceName),
+			attribute.String("secretless.connector.id", proxy.connectorID),
 		)
 		return errors.Wrap(err, "failed on retrieve credentials")
 	}
@@ -230,8 +230,8 @@ func (proxy *proxyService) handleConnection(clientConn net.Conn) error {
 		outcome = "connect_error"
 		span.SetStatus(codes.Error, "backend connect failed")
 		telemetry.EmitEvent(ctx, otellog.SeverityError, "tcp proxy backend connect failed",
-			otellog.String("secretless.service.name", proxy.serviceName),
-			otellog.String("secretless.connector.id", proxy.connectorID),
+			attribute.String("secretless.service.name", proxy.serviceName),
+			attribute.String("secretless.connector.id", proxy.connectorID),
 		)
 		return errors.Wrap(err, "failed on connect")
 	}

@@ -18,7 +18,7 @@ import (
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
-	semconv "go.opentelemetry.io/otel/semconv/v1.40.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 )
 
 var otelEnvVars = []string{
@@ -174,7 +174,7 @@ func TestInit_OTLPHTTPExportsTracesMetricsAndLogs(t *testing.T) {
 	span.End()
 
 	EmitEvent(ctx, otellog.SeverityInfo, "hello-otel-log",
-		otellog.String("secretless.service.name", "feishu"),
+		attribute.String("secretless.service.name", "feishu"),
 	)
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

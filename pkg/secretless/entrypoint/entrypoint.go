@@ -219,8 +219,8 @@ func reloadConfig(
 		span.SetStatus(codes.Error, "config prepare failed")
 		telemetry.RecordConfigReload(ctx, "error")
 		telemetry.EmitEvent(ctx, otellog.SeverityError, "configuration reload failed",
-			otellog.String("secretless.stage", "prepare"),
-			otellog.Int("secretless.services.count", len(cfg.Services)),
+			attribute.String("secretless.stage", "prepare"),
+			attribute.Int("secretless.services.count", len(cfg.Services)),
 		)
 		return nil, fmt.Errorf("cannot create all requested services: %s", err)
 	}
@@ -233,15 +233,15 @@ func reloadConfig(
 		span.SetStatus(codes.Error, "services start failed")
 		telemetry.RecordConfigReload(ctx, "error")
 		telemetry.EmitEvent(ctx, otellog.SeverityError, "configuration reload failed",
-			otellog.String("secretless.stage", "start"),
-			otellog.Int("secretless.services.count", len(cfg.Services)),
+			attribute.String("secretless.stage", "start"),
+			attribute.Int("secretless.services.count", len(cfg.Services)),
 		)
 		return nil, fmt.Errorf("Failed to start services: %s", err)
 	}
 
 	telemetry.RecordConfigReload(ctx, "ok")
 	telemetry.EmitEvent(ctx, otellog.SeverityInfo, "configuration reloaded",
-		otellog.Int("secretless.services.count", len(cfg.Services)),
+		attribute.Int("secretless.services.count", len(cfg.Services)),
 	)
 
 	// Health check: Live

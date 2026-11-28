@@ -153,8 +153,8 @@ func (resolver *Resolver) resolveForProvider(
 		outcome = "error"
 		span.SetStatus(codes.Error, "credential resolution failed")
 		telemetry.EmitEvent(spanCtx, otellog.SeverityError, "credential resolution failed",
-			otellog.String("secretless.provider.id", providerID),
-			otellog.Int("secretless.credential.count", len(credentials)),
+			attribute.String("secretless.provider.id", providerID),
+			attribute.Int("secretless.credential.count", len(credentials)),
 		)
 		// Sort the error strings to provide deterministic output
 		sort.Strings(providerErrStrings)

@@ -252,10 +252,10 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 		outcome = "rejected"
 		span.SetAttributes(attribute.String("secretless.rejection.reason", reason))
 		telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
-			otellog.String("secretless.service.name", serviceName),
-			otellog.String("secretless.connector.id", connectorID),
-			otellog.String("secretless.rejection.reason", reason),
-			otellog.Int("http.response.status_code", statusCode),
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+			attribute.String("secretless.rejection.reason", reason),
+			attribute.Int("http.response.status_code", statusCode),
 		)
 		return
 	}
@@ -277,10 +277,10 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 		outcome = "rejected"
 		span.SetAttributes(attribute.String("secretless.rejection.reason", "no_matching_service"))
 		telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
-			otellog.String("secretless.service.name", serviceName),
-			otellog.String("secretless.connector.id", connectorID),
-			otellog.String("secretless.rejection.reason", "no_matching_service"),
-			otellog.Int("http.response.status_code", statusCode),
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+			attribute.String("secretless.rejection.reason", "no_matching_service"),
+			attribute.Int("http.response.status_code", statusCode),
 		)
 		gohttp.Error(w, "forbidden: no configured service matches this request", 403)
 		return
@@ -301,10 +301,10 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 			outcome = "rejected"
 			span.SetAttributes(attribute.String("secretless.rejection.reason", "upstream_scheme_mismatch"))
 			telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
-				otellog.String("secretless.service.name", serviceName),
-				otellog.String("secretless.connector.id", connectorID),
-				otellog.String("secretless.rejection.reason", "upstream_scheme_mismatch"),
-				otellog.Int("http.response.status_code", statusCode),
+				attribute.String("secretless.service.name", serviceName),
+				attribute.String("secretless.connector.id", connectorID),
+				attribute.String("secretless.rejection.reason", "upstream_scheme_mismatch"),
+				attribute.Int("http.response.status_code", statusCode),
 			)
 			logger.Warnf(
 				"Blocked request to '%s://%s': upstreamURL only allows scheme '%s'",
@@ -320,10 +320,10 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 			outcome = "rejected"
 			span.SetAttributes(attribute.String("secretless.rejection.reason", "upstream_host_mismatch"))
 			telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
-				otellog.String("secretless.service.name", serviceName),
-				otellog.String("secretless.connector.id", connectorID),
-				otellog.String("secretless.rejection.reason", "upstream_host_mismatch"),
-				otellog.Int("http.response.status_code", statusCode),
+				attribute.String("secretless.service.name", serviceName),
+				attribute.String("secretless.connector.id", connectorID),
+				attribute.String("secretless.rejection.reason", "upstream_host_mismatch"),
+				attribute.Int("http.response.status_code", statusCode),
 			)
 			logger.Warnf(
 				"Blocked request to '%s://%s': upstreamURL only allows host '%s'",
@@ -356,9 +356,9 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 		outcome = "error"
 		span.SetStatus(codes.Error, "credential retrieval failed")
 		telemetry.EmitEvent(ctx, otellog.SeverityError, "http proxy credential retrieval failed",
-			otellog.String("secretless.service.name", serviceName),
-			otellog.String("secretless.connector.id", connectorID),
-			otellog.Int("http.response.status_code", statusCode),
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+			attribute.Int("http.response.status_code", statusCode),
 		)
 		gohttp.Error(w, err.Error(), 500)
 		return
@@ -407,9 +407,9 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 		outcome = "error"
 		span.SetStatus(codes.Error, "connector authentication failed")
 		telemetry.EmitEvent(ctx, otellog.SeverityError, "http proxy connector authentication failed",
-			otellog.String("secretless.service.name", serviceName),
-			otellog.String("secretless.connector.id", connectorID),
-			otellog.Int("http.response.status_code", statusCode),
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+			attribute.Int("http.response.status_code", statusCode),
 		)
 		gohttp.Error(w, err.Error(), 500)
 		return
@@ -480,9 +480,9 @@ func (proxy *proxyService) handleRequest(
 		upstreamSpan.SetStatus(codes.Error, "upstream roundtrip failed")
 		telemetry.RecordHTTPUpstream(upstreamCtx, serviceName, connectorID, r.Method, 503, "error", upstreamDur)
 		telemetry.EmitEvent(upstreamCtx, otellog.SeverityError, "http proxy upstream roundtrip failed",
-			otellog.String("secretless.service.name", serviceName),
-			otellog.String("secretless.connector.id", connectorID),
-			otellog.Int("http.response.status_code", 503),
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+			attribute.Int("http.response.status_code", 503),
 		)
 		logger.Debugf("Error: %v\n", err)
 		gohttp.Error(w, err.Error(), 503)

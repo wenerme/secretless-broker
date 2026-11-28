@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	otellog "go.opentelemetry.io/otel/log"
 	"go.opentelemetry.io/otel/log/global"
 )
@@ -15,7 +16,7 @@ import (
 // name, connector ID, provider ID, status code, or static outcome/reason) and
 // must never pass credential values, raw error strings, URL paths/queries, or
 // raw credential identifiers.
-func EmitEvent(ctx context.Context, severity otellog.Severity, body string, attrs ...otellog.KeyValue) {
+func EmitEvent(ctx context.Context, severity otellog.Severity, body string, attrs ...attribute.KeyValue) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -27,7 +28,7 @@ func EmitEvent(ctx context.Context, severity otellog.Severity, body string, attr
 	var rec otellog.Record
 	rec.SetTimestamp(time.Now())
 	rec.SetSeverity(severity)
-	rec.SetBody(otellog.StringValue(body))
+	rec.SetBody(attribute.StringValue(body))
 	if len(attrs) > 0 {
 		rec.AddAttributes(attrs...)
 	}
