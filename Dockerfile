@@ -17,13 +17,9 @@ RUN update-ca-certificates
 
 WORKDIR /secretless
 
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 ARG CGO_ENABLED=1
-
-ENV GOOS=${TARGETOS} \
-    GOARCH=${TARGETARCH} \
-    CGO_ENABLED=${CGO_ENABLED}
 
 COPY go.mod go.sum /secretless/
 COPY third_party/ /secretless/third_party
@@ -45,10 +41,11 @@ ARG VERSION=""
 # pkg/secretless.Version.
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    LDFLAGS="-s -w -X github.com/cyberark/secretless-broker/pkg/secretless.Tag=${TAG}"; \
+    export GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-$(go env GOARCH)}" CGO_ENABLED="${CGO_ENABLED}" && \
+    LDFLAGS="-s -w -X github.com/cyberark/secretless-broker/pkg/secretless.Tag=${TAG}" && \
     if [ -n "${VERSION}" ]; then \
       LDFLAGS="${LDFLAGS} -X github.com/cyberark/secretless-broker/pkg/secretless.Version=${VERSION}"; \
-    fi; \
+    fi && \
     mkdir -p /out && \
     go build -ldflags="${LDFLAGS}" -o /out/secretless-broker ./cmd/secretless-broker && \
     go build -ldflags="-s -w" -o /out/summon2 ./cmd/summon2
@@ -107,13 +104,9 @@ RUN update-ca-certificates
 
 WORKDIR /secretless
 
-ARG TARGETOS=linux
-ARG TARGETARCH=amd64
+ARG TARGETOS
+ARG TARGETARCH
 ARG CGO_ENABLED=1
-
-ENV GOOS=${TARGETOS} \
-    GOARCH=${TARGETARCH} \
-    CGO_ENABLED=${CGO_ENABLED}
 
 COPY go.mod go.sum /secretless/
 COPY third_party/ /secretless/third_party
@@ -131,10 +124,11 @@ ARG VERSION=""
 
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    LDFLAGS="-s -w -X github.com/cyberark/secretless-broker/pkg/secretless.Tag=${TAG}"; \
+    export GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH:-$(go env GOARCH)}" CGO_ENABLED="${CGO_ENABLED}" && \
+    LDFLAGS="-s -w -X github.com/cyberark/secretless-broker/pkg/secretless.Tag=${TAG}" && \
     if [ -n "${VERSION}" ]; then \
       LDFLAGS="${LDFLAGS} -X github.com/cyberark/secretless-broker/pkg/secretless.Version=${VERSION}"; \
-    fi; \
+    fi && \
     mkdir -p /out && \
     go build -ldflags="${LDFLAGS}" -o /out/secretless-broker ./cmd/secretless-broker && \
     go build -ldflags="-s -w" -o /out/summon2 ./cmd/summon2
