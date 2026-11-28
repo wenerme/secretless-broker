@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -10,13 +11,23 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"time"
 
 	"github.com/cyberark/secretless-broker/pkg/secretless/plugin/connector/http"
 	validation "github.com/go-ozzo/ozzo-validation"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/cyberark/secretless-broker/internal"
+	"github.com/cyberark/secretless-broker/internal/telemetry"
 	"github.com/cyberark/secretless-broker/pkg/secretless/log"
 )
+
+const httpTelemetryScope = "github.com/cyberark/secretless-broker/internal/plugin/connectors/http"
 
 // Subservice handles specific traffic within an HTTP proxy service, using
 // traffic filtering rules and a devoted Connector.
@@ -29,15 +40,34 @@ type Subservice struct {
 	// having it are minimal so far. This is something we should keep an eye on
 	// and refactor if it comes up again.
 
-	Connector                http.Connector
-	ConnectorID              string
-	RetrieveCredentials      internal.CredentialsRetriever
-	AuthenticateURLsMatching []*regexp.Regexp
+	ServiceName                string
+	Connector                  http.Connector
+	ConnectorID                string
+	RetrieveCredentials        internal.CredentialsRetriever
+	RetrieveCredentialsContext internal.ContextCredentialsRetriever
+	AuthenticateURLsMatching   []*regexp.Regexp
 	// UpstreamURL, when set, pins all credentialed requests to this upstream
 	// host. Requests targeting any other host are rejected with HTTP 403 before
 	// credentials are fetched or injected. This prevents credential exfiltration
 	// to attacker-controlled hosts.
 	UpstreamURL *url.URL
+}
+
+func (sub *Subservice) serviceLabel() string {
+	if sub.ServiceName != "" {
+		return sub.ServiceName
+	}
+	if sub.ConnectorID != "" {
+		return sub.ConnectorID
+	}
+	return "unknown"
+}
+
+func (sub *Subservice) retrieveCredentials(ctx context.Context) (map[string][]byte, error) {
+	if sub.RetrieveCredentialsContext != nil {
+		return sub.RetrieveCredentialsContext(ctx)
+	}
+	return sub.RetrieveCredentials()
 }
 
 // Matches returns true if any of the patterns in the Subservice's
@@ -180,6 +210,36 @@ func (proxy *proxyService) selectSubservice(r *gohttp.Request) *Subservice {
 // ServeHTTP exists to implement the go_http.Handler interface
 func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request) {
 	logger := proxy.logger
+	start := time.Now()
+
+	// Extract incoming trace context before any headers are touched.
+	ctx := otel.GetTextMapPropagator().Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+	tracer := telemetry.Tracer(httpTelemetryScope)
+	ctx, span := tracer.Start(
+		ctx,
+		"secretless.http.proxy",
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(
+			attribute.String("http.request.method", telemetry.NormalizeHTTPMethod(r.Method)),
+			attribute.String("url.scheme", r.URL.Scheme),
+			attribute.String("server.address", r.URL.Hostname()),
+			attribute.String("secretless.proxy.protocol", "http"),
+		),
+	)
+
+	serviceName := "unmatched"
+	connectorID := "none"
+	statusCode := 500
+	outcome := "error"
+	defer func() {
+		span.SetAttributes(
+			attribute.Int("http.response.status_code", statusCode),
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+		)
+		telemetry.RecordHTTPRequest(ctx, serviceName, connectorID, r.Method, statusCode, outcome, time.Since(start))
+		span.End()
+	}()
 
 	// Log request
 	logMsg := "Got request %v %v %v %v"
@@ -187,7 +247,16 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 
 	// Validate request
 
-	if !proxy.validateProxyServerRules(w, r) {
+	if code, reason, ok := proxy.validateProxyServerRules(w, r); !ok {
+		statusCode = code
+		outcome = "rejected"
+		span.SetAttributes(attribute.String("secretless.rejection.reason", reason))
+		telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
+			otellog.String("secretless.service.name", serviceName),
+			otellog.String("secretless.connector.id", connectorID),
+			otellog.String("secretless.rejection.reason", reason),
+			otellog.Int("http.response.status_code", statusCode),
+		)
 		return
 	}
 
@@ -204,9 +273,23 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 	// No match: reject the request. Previously unmatched requests were forwarded
 	// as an unauthenticated open proxy, enabling SSRF pivots into backend networks.
 	if subservice == nil {
+		statusCode = 403
+		outcome = "rejected"
+		span.SetAttributes(attribute.String("secretless.rejection.reason", "no_matching_service"))
+		telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
+			otellog.String("secretless.service.name", serviceName),
+			otellog.String("secretless.connector.id", connectorID),
+			otellog.String("secretless.rejection.reason", "no_matching_service"),
+			otellog.Int("http.response.status_code", statusCode),
+		)
 		gohttp.Error(w, "forbidden: no configured service matches this request", 403)
 		return
 	}
+
+	serviceName = subservice.serviceLabel()
+	connectorID = subservice.ConnectorID
+	telemetry.AddHTTPActiveRequest(ctx, serviceName, connectorID, 1)
+	defer telemetry.AddHTTPActiveRequest(ctx, serviceName, connectorID, -1)
 
 	// Validate upstream destination: if upstreamURL is configured, reject
 	// requests targeting any other host. This prevents credential exfiltration
@@ -214,6 +297,15 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 	// untrusted hosts.
 	if subservice.UpstreamURL != nil {
 		if r.URL.Scheme != subservice.UpstreamURL.Scheme {
+			statusCode = 403
+			outcome = "rejected"
+			span.SetAttributes(attribute.String("secretless.rejection.reason", "upstream_scheme_mismatch"))
+			telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
+				otellog.String("secretless.service.name", serviceName),
+				otellog.String("secretless.connector.id", connectorID),
+				otellog.String("secretless.rejection.reason", "upstream_scheme_mismatch"),
+				otellog.Int("http.response.status_code", statusCode),
+			)
 			logger.Warnf(
 				"Blocked request to '%s://%s': upstreamURL only allows scheme '%s'",
 				r.URL.Scheme,
@@ -224,6 +316,15 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 			return
 		}
 		if normalizeHost(r.URL.Host, r.URL.Scheme) != normalizeHost(subservice.UpstreamURL.Host, subservice.UpstreamURL.Scheme) {
+			statusCode = 403
+			outcome = "rejected"
+			span.SetAttributes(attribute.String("secretless.rejection.reason", "upstream_host_mismatch"))
+			telemetry.EmitEvent(ctx, otellog.SeverityWarn, "http proxy request rejected",
+				otellog.String("secretless.service.name", serviceName),
+				otellog.String("secretless.connector.id", connectorID),
+				otellog.String("secretless.rejection.reason", "upstream_host_mismatch"),
+				otellog.Int("http.response.status_code", statusCode),
+			)
 			logger.Warnf(
 				"Blocked request to '%s://%s': upstreamURL only allows host '%s'",
 				r.URL.Scheme,
@@ -237,66 +338,164 @@ func (proxy *proxyService) ServeHTTP(w gohttp.ResponseWriter, r *gohttp.Request)
 
 	// Get current credential values
 
-	creds, err := subservice.RetrieveCredentials()
+	credCtx, credSpan := tracer.Start(
+		ctx,
+		"secretless.credentials.resolve",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+		),
+	)
+	creds, err := subservice.retrieveCredentials(credCtx)
 	defer internal.ZeroizeCredentials(creds)
-
 	if err != nil {
+		credSpan.SetStatus(codes.Error, "credential retrieval failed")
+		credSpan.End()
+		statusCode = 500
+		outcome = "error"
+		span.SetStatus(codes.Error, "credential retrieval failed")
+		telemetry.EmitEvent(ctx, otellog.SeverityError, "http proxy credential retrieval failed",
+			otellog.String("secretless.service.name", serviceName),
+			otellog.String("secretless.connector.id", connectorID),
+			otellog.Int("http.response.status_code", statusCode),
+		)
 		gohttp.Error(w, err.Error(), 500)
 		return
+	}
+	credSpan.End()
+
+	// Create the upstream client span before connector authentication so the
+	// injected traceparent carries the client span's SpanID (making downstream
+	// spans children of secretless.http.upstream) while still allowing
+	// request-signing connectors to sign the final headers and connector-defined
+	// headers to take precedence.
+	upstreamCtx, upstreamSpan := tracer.Start(
+		ctx,
+		"secretless.http.upstream",
+		trace.WithSpanKind(trace.SpanKindClient),
+		trace.WithAttributes(
+			attribute.String("http.request.method", telemetry.NormalizeHTTPMethod(r.Method)),
+			attribute.String("url.scheme", r.URL.Scheme),
+			attribute.String("server.address", r.URL.Hostname()),
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+		),
+	)
+	if upstreamSpan.SpanContext().IsValid() {
+		otel.GetTextMapPropagator().Inject(upstreamCtx, propagation.HeaderCarrier(r.Header))
 	}
 
 	// Authenticate request
 
+	_, authSpan := tracer.Start(
+		ctx,
+		"secretless.connector.authenticate",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("secretless.service.name", serviceName),
+			attribute.String("secretless.connector.id", connectorID),
+		),
+	)
 	err = subservice.Connector.Connect(r, creds)
 	if err != nil {
+		authSpan.SetStatus(codes.Error, "connector authentication failed")
+		authSpan.End()
+		upstreamSpan.SetStatus(codes.Error, "connector authentication failed")
+		upstreamSpan.End()
+		statusCode = 500
+		outcome = "error"
+		span.SetStatus(codes.Error, "connector authentication failed")
+		telemetry.EmitEvent(ctx, otellog.SeverityError, "http proxy connector authentication failed",
+			otellog.String("secretless.service.name", serviceName),
+			otellog.String("secretless.connector.id", connectorID),
+			otellog.Int("http.response.status_code", statusCode),
+		)
 		gohttp.Error(w, err.Error(), 500)
 		return
 	}
+	authSpan.End()
 
 	// Send request to target service
 
-	proxy.handleRequest(w, r)
+	statusCode, outcome = proxy.handleRequest(upstreamCtx, upstreamSpan, w, r, serviceName, connectorID)
+	if statusCode >= 500 {
+		span.SetStatus(codes.Error, gohttp.StatusText(statusCode))
+	}
 }
 
 // validateProxyServerRules ensures that the request being made is a valid
 // request for a proxy server.
 func (proxy *proxyService) validateProxyServerRules(
 	w gohttp.ResponseWriter, r *gohttp.Request,
-) bool {
+) (int, string, bool) {
 
 	if r.Method == "CONNECT" {
 		gohttp.Error(w, "CONNECT is not supported.", 405)
-		return false
+		return 405, "connect_not_supported", false
 	}
 
 	if !r.URL.IsAbs() {
 		errMsg := "This is a proxy server. Non-proxy requests aren't allowed."
 		gohttp.Error(w, errMsg, 500)
-		return false
+		return 500, "non_proxy_request", false
 	}
 
-	return true
+	return 0, "", true
 }
 
 // handleRequest sends the request to the target service and writes the response
 // back to the client.
 func (proxy *proxyService) handleRequest(
-	w gohttp.ResponseWriter, r *gohttp.Request,
-) {
+	upstreamCtx context.Context,
+	upstreamSpan trace.Span,
+	w gohttp.ResponseWriter,
+	r *gohttp.Request,
+	serviceName string,
+	connectorID string,
+) (int, string) {
 	logger := proxy.logger
+	defer upstreamSpan.End()
 
 	// Per the stdlib docs, "It is an error to set this field in an HTTP client
 	// request". Therefore, we ensure it is empty in case the client set it.
 	r.RequestURI = ""
 
+	// Update scheme/host attributes in case the connector rewrote the target
+	// (for example forceSSL upgrading http to https or AWS endpoint resolution).
+	upstreamSpan.SetAttributes(
+		attribute.String("url.scheme", r.URL.Scheme),
+		attribute.String("server.address", r.URL.Hostname()),
+	)
+
+	upstreamStart := time.Now()
+	r = r.WithContext(upstreamCtx)
+
 	// Send request to target service
 
 	resp, err := proxy.transport.RoundTrip(r)
+	upstreamDur := time.Since(upstreamStart)
 	if err != nil {
+		upstreamSpan.SetAttributes(attribute.Int("http.response.status_code", 503))
+		upstreamSpan.SetStatus(codes.Error, "upstream roundtrip failed")
+		telemetry.RecordHTTPUpstream(upstreamCtx, serviceName, connectorID, r.Method, 503, "error", upstreamDur)
+		telemetry.EmitEvent(upstreamCtx, otellog.SeverityError, "http proxy upstream roundtrip failed",
+			otellog.String("secretless.service.name", serviceName),
+			otellog.String("secretless.connector.id", connectorID),
+			otellog.Int("http.response.status_code", 503),
+		)
 		logger.Debugf("Error: %v\n", err)
 		gohttp.Error(w, err.Error(), 503)
-		return
+		return 503, "error"
 	}
+
+	upstreamOutcome := "ok"
+	if resp.StatusCode >= 500 {
+		upstreamOutcome = "error"
+		upstreamSpan.SetStatus(codes.Error, gohttp.StatusText(resp.StatusCode))
+	}
+	upstreamSpan.SetAttributes(attribute.Int("http.response.status_code", resp.StatusCode))
+	telemetry.RecordHTTPUpstream(upstreamCtx, serviceName, connectorID, r.Method, resp.StatusCode, upstreamOutcome, upstreamDur)
 
 	// Send response to client (everything below)
 
@@ -315,6 +514,8 @@ func (proxy *proxyService) handleRequest(
 	if err != nil {
 		logger.Debugf("Can't close response body %v\n", err)
 	}
+
+	return resp.StatusCode, upstreamOutcome
 }
 
 // Start initiates the net.Listener to listen for incoming connections

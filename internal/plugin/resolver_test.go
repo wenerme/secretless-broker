@@ -17,8 +17,8 @@ var fatalErrors []string
 func newInstance() plugin_v1.Resolver {
 	fatalErrors = []string{}
 	logFatalf := func(format string, args ...interface{}) {
-		fatalErrors = append(fatalErrors, fmt.Sprintf(format, args))
-		panic(fmt.Errorf(format, args))
+		fatalErrors = append(fatalErrors, fmt.Sprintf(format, args...))
+		panic(fmt.Errorf(format, args...))
 	}
 
 	return NewResolver(providers.ProviderFactories, nil, logFatalf)

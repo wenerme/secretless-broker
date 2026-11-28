@@ -1,9 +1,15 @@
 package internal
 
+import "context"
+
 // CredentialsRetriever is a function signature for retrieval of credentials.
 // The purpose of a CredentialsRetriever is to deliver credentials from within
 // ProxyService instances and so it takes no arguments.
 type CredentialsRetriever func() (map[string][]byte, error)
+
+// ContextCredentialsRetriever is a context-aware variant of CredentialsRetriever
+// used to propagate cancellation and OpenTelemetry trace context to providers.
+type ContextCredentialsRetriever func(context.Context) (map[string][]byte, error)
 
 // ZeroizeCredentials zeroizes the values of the fetched credentials. We don't want to
 // rely on garbage collection for this (it might be slow and/or only free them) so

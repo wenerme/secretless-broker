@@ -1,6 +1,8 @@
 package v1
 
 import (
+	"context"
+
 	config_v2 "github.com/cyberark/secretless-broker/pkg/secretless/config/v2"
 )
 
@@ -13,4 +15,10 @@ type Resolver interface {
 
 	// Resolve accepts an array of credentials and returns a map of resolved ones
 	Resolve(credentials []*config_v2.Credential) (result map[string][]byte, err error)
+}
+
+// ContextResolver is an optional interface implemented by resolvers that
+// propagate context to OpenTelemetry spans, metrics, and context-aware providers.
+type ContextResolver interface {
+	ResolveContext(ctx context.Context, credentials []*config_v2.Credential) (result map[string][]byte, err error)
 }

@@ -1,6 +1,7 @@
 package proxyservice
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -37,11 +38,19 @@ type proxyServices struct {
 
 // Start starts all proxy services
 func (s *proxyServices) Start() error {
-	for _, svc := range s.servicesToStart() {
+	services, err := s.servicesToStart()
+	if err != nil {
+		for _, svc := range services {
+			_ = svc.Stop()
+		}
+		return err
+	}
+
+	for _, svc := range services {
 		err := svc.Start()
 		if err != nil {
-			// TODO: Upgrade our logger so we can use Fatalf here
-			s.logger.Panicf("could not start proxy service: %s", err)
+			_ = s.Stop()
+			return fmt.Errorf("could not start proxy service: %s", err)
 		}
 		s.runningServices = append(s.runningServices, svc)
 	}
@@ -69,7 +78,7 @@ func (s *proxyServices) Stop() error {
 	return nil
 }
 
-func (s *proxyServices) servicesToStart() (servicesToStart []internal.Service) {
+func (s *proxyServices) servicesToStart() (servicesToStart []internal.Service, err error) {
 	httpPlugins := s.availPlugins.HTTPPlugins()
 	tcpPlugins := s.availPlugins.TCPPlugins()
 
@@ -134,11 +143,14 @@ func (s *proxyServices) servicesToStart() (servicesToStart []internal.Service) {
 		servicesToStart = append(servicesToStart, sshAgentSvc)
 	}
 
-	// If there are errors, we need to show them. This method exits the
-	// program if any errors are detected.
-	handleErrors(errors, s.logger)
+	if len(errors) > 0 {
+		for cfgName, svcErr := range errors {
+			s.logger.Errorf("Fatal error in '%s': %s", cfgName, svcErr)
+		}
+		return servicesToStart, errors.Filter()
+	}
 
-	return servicesToStart
+	return servicesToStart, nil
 }
 
 func handleErrors(errors validation.Errors, logger logapi.Logger) {
@@ -200,11 +212,13 @@ func (s *proxyServices) createHTTPService(
 		}
 
 		subservices = append(subservices, httpproxy.Subservice{
-			ConnectorID:              subCfg.Connector, // TODO: Rename connectorID
-			Connector:                curConnector,
-			RetrieveCredentials:      credsRetriever,
-			AuthenticateURLsMatching: httpCfg.AuthenticateURLsMatching,
-			UpstreamURL:              httpCfg.UpstreamURL,
+			ServiceName:                subCfg.Name,
+			ConnectorID:                subCfg.Connector, // TODO: Rename connectorID
+			Connector:                  curConnector,
+			RetrieveCredentials:        credsRetriever,
+			RetrieveCredentialsContext: s.credsRetrieverContext(subCfg.Credentials),
+			AuthenticateURLsMatching:   httpCfg.AuthenticateURLsMatching,
+			UpstreamURL:                httpCfg.UpstreamURL,
 		})
 	}
 
@@ -242,11 +256,13 @@ func (s *proxyServices) createSSHService(
 	credsRetriever := s.credsRetriever(config.Credentials)
 
 	// TODO: NewProxyService needs to be injected
-	newSvc, err := sshproxy.NewProxyService(
-		listener,
-		connResources.Logger(),
-		credsRetriever,
-	)
+	newSvc, err := sshproxy.NewProxyServiceWithOptions(sshproxy.ProxyServiceOptions{
+		ServiceName:                config.Name,
+		Listener:                   listener,
+		Logger:                     connResources.Logger(),
+		RetrieveCredentials:        credsRetriever,
+		RetrieveCredentialsContext: s.credsRetrieverContext(config.Credentials),
+	})
 
 	if err != nil {
 		s.logger.Errorf("could not create proxy service '%s'", config.Name)
@@ -275,11 +291,13 @@ func (s *proxyServices) createSSHAgentService(
 	credsRetriever := s.credsRetriever(config.Credentials)
 
 	// TODO: NewProxyService needs to be injected
-	newSvc, err := sshagentproxy.NewProxyService(
-		listener,
-		connResources.Logger(),
-		credsRetriever,
-	)
+	newSvc, err := sshagentproxy.NewProxyServiceWithOptions(sshagentproxy.ProxyServiceOptions{
+		ServiceName:                config.Name,
+		Listener:                   listener,
+		Logger:                     connResources.Logger(),
+		RetrieveCredentials:        credsRetriever,
+		RetrieveCredentialsContext: s.credsRetrieverContext(config.Credentials),
+	})
 
 	if err != nil {
 		s.logger.Errorf("could not create proxy service '%s'", config.Name)
@@ -325,12 +343,15 @@ func (s *proxyServices) createTCPService(
 	credsRetriever := s.credsRetriever(config.Credentials)
 
 	// TODO: NewTCPProxyFunc needs to be injected
-	newSvc, err := tcpproxy.NewProxyService(
-		svcConnector,
-		listener,
-		connResources.Logger(),
-		credsRetriever,
-	)
+	newSvc, err := tcpproxy.NewProxyServiceWithOptions(tcpproxy.ProxyServiceOptions{
+		ServiceName:                config.Name,
+		ConnectorID:                config.Connector,
+		Connector:                  svcConnector,
+		Listener:                   listener,
+		Logger:                     connResources.Logger(),
+		RetrieveCredentials:        credsRetriever,
+		RetrieveCredentialsContext: s.credsRetrieverContext(config.Credentials),
+	})
 
 	if err != nil {
 		s.logger.Errorf("could not create proxy service '%s'", config.Name)
@@ -353,6 +374,17 @@ func (s *proxyServices) credsRetriever(
 	creds []*v2.Credential,
 ) internal.CredentialsRetriever {
 	return func() (map[string][]byte, error) {
+		return s.resolver.Resolve(creds)
+	}
+}
+
+func (s *proxyServices) credsRetrieverContext(
+	creds []*v2.Credential,
+) internal.ContextCredentialsRetriever {
+	return func(ctx context.Context) (map[string][]byte, error) {
+		if ctxResolver, ok := s.resolver.(v1.ContextResolver); ok {
+			return ctxResolver.ResolveContext(ctx, creds)
+		}
 		return s.resolver.Resolve(creds)
 	}
 }

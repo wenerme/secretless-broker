@@ -97,53 +97,42 @@ func TestHandleErrors_ExitsOnError(t *testing.T) {
 }
 
 func TestCreateServiceFailures(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("os.Exit test not supported on Windows")
-	}
-	if os.Getenv("TEST_FAIL_SERVICE_EXIT") != "" {
-		failType := os.Getenv("TEST_FAIL_SERVICE_EXIT")
-		ps := &proxyServices{
-			logger:   &testLogger{},
-			resolver: &mockResolver{},
-		}
-		switch failType {
-		case "tcp":
-			ps.configsByType = v2.ConfigsByType{TCP: []v2.Service{{Name: "svc", Connector: "mock", ListenOn: v2.NetworkAddress("tcp://bad:0")}}}
-			ps.availPlugins = &fakeAvailablePlugins{}
-		case "http":
-			ps.configsByType = v2.ConfigsByType{HTTP: []v2.HTTPServiceConfig{{
-				SharedListenOn:    v2.NetworkAddress("tcp://bad:0"),
-				SubserviceConfigs: []v2.Service{{Name: "svc", Connector: "mock", ConnectorConfig: []byte("{}")}},
-			}}}
-			ps.availPlugins = &fakeAvailablePlugins{}
-		case "ssh":
-			ps.configsByType = v2.ConfigsByType{SSH: []v2.Service{{Name: "svc", Connector: "mock", ListenOn: v2.NetworkAddress("tcp://bad:0")}}}
-			ps.availPlugins = &fakeAvailablePlugins{}
-		case "sshagent":
-			ps.configsByType = v2.ConfigsByType{SSHAgent: []v2.Service{{Name: "svc", Connector: "mock", ListenOn: v2.NetworkAddress("tcp://bad:0")}}}
-			ps.availPlugins = &fakeAvailablePlugins{}
-		}
-		ps.Start()
-		return
-	}
 	types := []struct {
 		name string
-		env  string
+		cfg  v2.ConfigsByType
 	}{
-		{"TCP listener fail", "tcp"},
-		{"HTTP listener fail", "http"},
-		{"SSH listener fail", "ssh"},
-		{"SSHAgent listener fail", "sshagent"},
+		{
+			name: "TCP listener fail",
+			cfg:  v2.ConfigsByType{TCP: []v2.Service{{Name: "svc", Connector: "mock", ListenOn: v2.NetworkAddress("tcp://bad:0")}}},
+		},
+		{
+			name: "HTTP listener fail",
+			cfg: v2.ConfigsByType{HTTP: []v2.HTTPServiceConfig{{
+				SharedListenOn:    v2.NetworkAddress("tcp://bad:0"),
+				SubserviceConfigs: []v2.Service{{Name: "svc", Connector: "mock", ConnectorConfig: []byte("{}")}},
+			}}},
+		},
+		{
+			name: "SSH listener fail",
+			cfg:  v2.ConfigsByType{SSH: []v2.Service{{Name: "svc", Connector: "mock", ListenOn: v2.NetworkAddress("tcp://bad:0")}}},
+		},
+		{
+			name: "SSHAgent listener fail",
+			cfg:  v2.ConfigsByType{SSHAgent: []v2.Service{{Name: "svc", Connector: "mock", ListenOn: v2.NetworkAddress("tcp://bad:0")}}},
+		},
 	}
+
 	for _, tt := range types {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := exec.Command(os.Args[0], "-test.run=TestCreateServiceFailures")
-			cmd.Env = append(os.Environ(), "TEST_FAIL_SERVICE_EXIT="+tt.env)
-			err := cmd.Run()
-			if e, ok := err.(*exec.ExitError); ok && !e.Success() {
-				return
+			ps := &proxyServices{
+				logger:        &testLogger{},
+				resolver:      &mockResolver{},
+				configsByType: tt.cfg,
+				availPlugins:  &fakeAvailablePlugins{},
 			}
-			t.Fatalf("process did not exit as expected for %s, err=%v", tt.name, err)
+			err := ps.Start()
+			assert.Error(t, err)
+			assert.Empty(t, ps.runningServices)
 		})
 	}
 }

@@ -1,10 +1,17 @@
 package entrypoint
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"strings"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/cyberark/secretless-broker/internal"
 	"github.com/cyberark/secretless-broker/internal/configurationmanagers/configfile"
@@ -14,6 +21,7 @@ import (
 	"github.com/cyberark/secretless-broker/internal/profile"
 	"github.com/cyberark/secretless-broker/internal/proxyservice"
 	"github.com/cyberark/secretless-broker/internal/signal"
+	"github.com/cyberark/secretless-broker/internal/telemetry"
 	"github.com/cyberark/secretless-broker/internal/util"
 	"github.com/cyberark/secretless-broker/pkg/secretless"
 	v2 "github.com/cyberark/secretless-broker/pkg/secretless/config/v2"
@@ -21,6 +29,8 @@ import (
 	"github.com/cyberark/secretless-broker/pkg/secretless/plugin"
 	"github.com/cyberark/secretless-broker/pkg/secretless/plugin/sharedobj"
 )
+
+const telemetryShutdownTimeout = 5 * time.Second
 
 // SecretlessOptions holds the command line flag information that Service was
 // started with.
@@ -57,6 +67,14 @@ func StartSecretless(params *SecretlessOptions) {
 	exitListener := signal.NewExitListener()
 
 	logger := secretlessLog.New(params.DebugEnabled)
+
+	telemetryProvider, err := telemetry.Init(context.Background())
+	if err != nil {
+		logger.Errorf("Failed to initialize OpenTelemetry (continuing with telemetry disabled): %s", err)
+	} else if telemetryProvider.Enabled() {
+		logger.Infof("OpenTelemetry initialized (%s)", telemetryProvider.Summary())
+	}
+
 	availPlugins, err := sharedobj.AllAvailablePlugins(
 		params.PluginDir,
 		params.PluginChecksumsFile,
@@ -86,7 +104,7 @@ func StartSecretless(params *SecretlessOptions) {
 
 	// Main listener for exit signals
 	exitListener.AddHandler(func() {
-		exitHandler(allServices, params)
+		exitHandler(allServices, telemetryProvider, params)
 	})
 
 	// Main processing loop
@@ -109,7 +127,12 @@ func StartSecretless(params *SecretlessOptions) {
 
 			logger.Info("Configuration found. Loading...")
 			configEnv := v2.NewConfigEnv(logger, availPlugins)
-			allServices = reloadConfig(cfg, configEnv, availPlugins, logger)
+			var reloadErr error
+			allServices, reloadErr = reloadConfig(cfg, configEnv, availPlugins, logger)
+			if reloadErr != nil {
+				shutdownTelemetry(telemetryProvider)
+				log.Fatalln(reloadErr)
+			}
 		}
 	}()
 
@@ -177,7 +200,15 @@ func reloadConfig(
 	cfg v2.Config,
 	configEnv v2.ConfigEnv,
 	availPlugins plugin.AvailablePlugins,
-	logger logapi.Logger) internal.Service {
+	logger logapi.Logger) (internal.Service, error) {
+
+	ctx, span := telemetry.Tracer("github.com/cyberark/secretless-broker/pkg/secretless/entrypoint").Start(
+		context.Background(),
+		"secretless.config.reload",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.Int("secretless.services.count", len(cfg.Services))),
+	)
+	defer span.End()
 
 	// Health check: Not live
 	util.SetAppIsLive(false)
@@ -185,8 +216,13 @@ func reloadConfig(
 	// Ensure config's requested services can be created.
 	err := configEnv.Prepare(cfg)
 	if err != nil {
-		log.Fatalf("cannot create all requested services: %s", err)
-		return nil
+		span.SetStatus(codes.Error, "config prepare failed")
+		telemetry.RecordConfigReload(ctx, "error")
+		telemetry.EmitEvent(ctx, otellog.SeverityError, "configuration reload failed",
+			otellog.String("secretless.stage", "prepare"),
+			otellog.Int("secretless.services.count", len(cfg.Services)),
+		)
+		return nil, fmt.Errorf("cannot create all requested services: %s", err)
 	}
 
 	// Start Services
@@ -194,17 +230,38 @@ func reloadConfig(
 	allServices := proxyservice.NewProxyServices(cfg, availPlugins, logger, evtNotifier)
 	err = allServices.Start()
 	if err != nil {
-		log.Fatalf("Failed to start services: %s", err)
-		return nil
+		span.SetStatus(codes.Error, "services start failed")
+		telemetry.RecordConfigReload(ctx, "error")
+		telemetry.EmitEvent(ctx, otellog.SeverityError, "configuration reload failed",
+			otellog.String("secretless.stage", "start"),
+			otellog.Int("secretless.services.count", len(cfg.Services)),
+		)
+		return nil, fmt.Errorf("Failed to start services: %s", err)
 	}
+
+	telemetry.RecordConfigReload(ctx, "ok")
+	telemetry.EmitEvent(ctx, otellog.SeverityInfo, "configuration reloaded",
+		otellog.Int("secretless.services.count", len(cfg.Services)),
+	)
 
 	// Health check: Live
 	util.SetAppIsLive(true)
 
-	return allServices
+	return allServices, nil
 }
 
-func exitHandler(allServices internal.Service, params *SecretlessOptions) {
+func shutdownTelemetry(telemetryProvider *telemetry.Provider) {
+	if telemetryProvider == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), telemetryShutdownTimeout)
+	defer cancel()
+	if err := telemetryProvider.Shutdown(ctx); err != nil {
+		log.Printf("Problem shutting down OpenTelemetry: %s", err)
+	}
+}
+
+func exitHandler(allServices internal.Service, telemetryProvider *telemetry.Provider, params *SecretlessOptions) {
 	fmt.Println("Received a stop signal")
 
 	osExit := func(code int) {
@@ -215,16 +272,15 @@ func exitHandler(allServices internal.Service, params *SecretlessOptions) {
 		}
 	}
 
-	if allServices == nil {
-		osExit(0)
-		return
+	if allServices != nil {
+		err := allServices.Stop()
+		if err != nil {
+			// Log but allow cleanup of other subscribers to continue.
+			log.Println(err)
+		}
 	}
 
-	err := allServices.Stop()
-	if err != nil {
-		// Log but but allow cleanup of other subscribers to continue.
-		log.Println(err)
-	}
+	shutdownTelemetry(telemetryProvider)
 
 	// TODO: Ideally we would soft-close all goroutines rather than rely on the
 	//       heavy-handed os.Exit to exit the broker when we want to.

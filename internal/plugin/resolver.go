@@ -1,13 +1,21 @@
 package plugin
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sort"
 	"strings"
 	"sync"
+	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	otellog "go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/trace"
 
 	plugin_v1 "github.com/cyberark/secretless-broker/internal/plugin/v1"
+	"github.com/cyberark/secretless-broker/internal/telemetry"
 	config_v2 "github.com/cyberark/secretless-broker/pkg/secretless/config/v2"
 )
 
@@ -17,6 +25,7 @@ type Resolver struct {
 	ProviderFactories map[string]func(plugin_v1.ProviderOptions) (plugin_v1.Provider, error)
 	Providers         map[string]plugin_v1.Provider
 	LogFatalf         func(string, ...interface{})
+	mu                sync.Mutex
 }
 
 // NewResolver instantiates providers based on the name and ProviderOptions
@@ -40,10 +49,8 @@ func NewResolver(
 
 // Provider finds or creates a named provider.
 func (resolver *Resolver) Provider(name string) (provider plugin_v1.Provider, err error) {
-	mutex := &sync.Mutex{}
-
-	mutex.Lock()
-	defer mutex.Unlock()
+	resolver.mu.Lock()
+	defer resolver.mu.Unlock()
 
 	if provider = resolver.Providers[name]; provider != nil {
 		return
@@ -71,12 +78,40 @@ func (resolver *Resolver) Provider(name string) (provider plugin_v1.Provider, er
 	return
 }
 
+func providerSpanKind(providerID string) trace.SpanKind {
+	switch providerID {
+	case "vault", "conjur", "aws", "kubernetes":
+		return trace.SpanKindClient
+	default:
+		return trace.SpanKindInternal
+	}
+}
+
 func (resolver *Resolver) resolveForProvider(
+	ctx context.Context,
 	providerID string,
 	credentials []*config_v2.Credential,
 ) (plugin_v1.Provider, map[string]plugin_v1.ProviderResponse, string) {
+	start := time.Now()
+	spanCtx, span := telemetry.Tracer("github.com/cyberark/secretless-broker/internal/plugin").Start(
+		ctx,
+		"secretless.provider.resolve",
+		trace.WithSpanKind(providerSpanKind(providerID)),
+		trace.WithAttributes(
+			attribute.String("secretless.provider.id", providerID),
+			attribute.Int("secretless.credential.count", len(credentials)),
+		),
+	)
+	outcome := "ok"
+	defer func() {
+		telemetry.RecordCredentialResolve(spanCtx, providerID, outcome, time.Since(start))
+		span.End()
+	}()
+
 	provider, err := resolver.Provider(providerID)
 	if err != nil {
+		outcome = "error"
+		span.SetStatus(codes.Error, "provider initialization failed")
 		resolver.LogFatalf("ERROR: Provider '%s' could not be used! %v", providerID, err)
 	}
 
@@ -89,7 +124,12 @@ func (resolver *Resolver) resolveForProvider(
 	// Resolves all credentials for current provider
 	var hasErrors bool
 	var providerErrStrings []string
-	providerResponses, err := provider.GetValues(secretIds...)
+	var providerResponses map[string]plugin_v1.ProviderResponse
+	if ctxProvider, ok := provider.(plugin_v1.ContextProvider); ok {
+		providerResponses, err = ctxProvider.GetValuesContext(spanCtx, secretIds...)
+	} else {
+		providerResponses, err = provider.GetValues(secretIds...)
+	}
 	if err != nil {
 		hasErrors = true
 		providerErrStrings = append(
@@ -110,6 +150,12 @@ func (resolver *Resolver) resolveForProvider(
 		}
 	}
 	if hasErrors {
+		outcome = "error"
+		span.SetStatus(codes.Error, "credential resolution failed")
+		telemetry.EmitEvent(spanCtx, otellog.SeverityError, "credential resolution failed",
+			otellog.String("secretless.provider.id", providerID),
+			otellog.Int("secretless.credential.count", len(credentials)),
+		)
 		// Sort the error strings to provide deterministic output
 		sort.Strings(providerErrStrings)
 
@@ -127,6 +173,15 @@ func (resolver *Resolver) resolveForProvider(
 // Resolve accepts n list of Providers and a list of Credentials and
 // attempts to obtain the value of each Credential from the appropriate Provider.
 func (resolver *Resolver) Resolve(credentials []*config_v2.Credential) (map[string][]byte, error) {
+	return resolver.ResolveContext(context.Background(), credentials)
+}
+
+// ResolveContext resolves credentials while propagating context to OpenTelemetry
+// spans, metrics, and context-aware providers.
+func (resolver *Resolver) ResolveContext(ctx context.Context, credentials []*config_v2.Credential) (map[string][]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if len(credentials) == 0 {
 		resolver.LogFatalf("ERROR! Credentials not defined in Resolve call!")
 	}
@@ -142,6 +197,7 @@ func (resolver *Resolver) Resolve(credentials []*config_v2.Credential) (map[stri
 	// Resolve credentials by provider
 	for providerID, credentialsForProvider := range credentialsByProvider {
 		provider, providerResponses, errStr := resolver.resolveForProvider(
+			ctx,
 			providerID,
 			credentialsForProvider,
 		)
@@ -174,7 +230,7 @@ func (resolver *Resolver) Resolve(credentials []*config_v2.Credential) (map[stri
 		// Sort the error strings to provide deterministic output
 		sort.Strings(errorStrings)
 
-		err = fmt.Errorf(strings.Join(errorStrings, "\n"))
+		err = fmt.Errorf("%s", strings.Join(errorStrings, "\n"))
 	}
 
 	return result, err

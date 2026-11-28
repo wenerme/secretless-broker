@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -114,8 +115,16 @@ func parseSecret(secret *vault.Secret, path string, fields string) ([]byte, erro
 // fields to the value in the secret must follow Vault API client conventions. Please see documentation of Vault for
 // details.
 func (p *Provider) GetValue(id string) ([]byte, error) {
+	return p.GetValueContext(context.Background(), id)
+}
+
+// GetValueContext obtains a value by id using the supplied context.
+func (p *Provider) GetValueContext(ctx context.Context, id string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	path, fields := parseVaultID(id)
-	secret, err := p.Client.Logical().Read(path)
+	secret, err := p.Client.Logical().ReadWithContext(ctx, path)
 	if err != nil {
 		return nil, err
 	}
@@ -131,4 +140,20 @@ func (p *Provider) GetValue(id string) ([]byte, error) {
 // needed to the Provider interface
 func (p *Provider) GetValues(ids ...string) (map[string]plugin_v1.ProviderResponse, error) {
 	return plugin_v1.GetValues(p, ids...)
+}
+
+// GetValuesContext resolves variable ids while propagating ctx to Vault API calls.
+func (p *Provider) GetValuesContext(ctx context.Context, ids ...string) (map[string]plugin_v1.ProviderResponse, error) {
+	responses := make(map[string]plugin_v1.ProviderResponse, len(ids))
+	for _, id := range ids {
+		if _, ok := responses[id]; ok {
+			continue
+		}
+		val, err := p.GetValueContext(ctx, id)
+		responses[id] = plugin_v1.ProviderResponse{
+			Value: val,
+			Error: err,
+		}
+	}
+	return responses, nil
 }

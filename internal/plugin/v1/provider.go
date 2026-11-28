@@ -1,5 +1,7 @@
 package v1
 
+import "context"
+
 // ProviderOptions contains the configuration for the provider instantiation
 type ProviderOptions struct {
 	// Name is the internal name that the provider will have. This may be different from
@@ -20,6 +22,12 @@ type Provider interface {
 
 	// GetValues takes in variable ids and returns their resolved values
 	GetValues(ids ...string) (map[string]ProviderResponse, error)
+}
+
+// ContextProvider is an optional interface that providers may implement to
+// receive request context (for cancellation and OpenTelemetry tracing).
+type ContextProvider interface {
+	GetValuesContext(ctx context.Context, ids ...string) (map[string]ProviderResponse, error)
 }
 
 type singleValueProvider interface {

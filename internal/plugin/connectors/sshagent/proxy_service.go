@@ -1,26 +1,45 @@
 package sshagent
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"time"
 
 	validation "github.com/go-ozzo/ozzo-validation"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/ssh/agent"
 
 	"github.com/cyberark/secretless-broker/internal"
+	"github.com/cyberark/secretless-broker/internal/telemetry"
 	"github.com/cyberark/secretless-broker/pkg/secretless/log"
 )
 
+const sshAgentTelemetryScope = "github.com/cyberark/secretless-broker/internal/plugin/connectors/sshagent"
+
+// ProxyServiceOptions configures an SSH-Agent ProxyService with optional telemetry metadata.
+type ProxyServiceOptions struct {
+	ServiceName                string
+	Listener                   net.Listener
+	Logger                     log.Logger
+	RetrieveCredentials        internal.CredentialsRetriever
+	RetrieveCredentialsContext internal.ContextCredentialsRetriever
+}
+
 type proxyService struct {
-	done                bool
-	listener            net.Listener
-	logger              log.Logger
-	keyring             agent.Agent
-	retrieveCredentials internal.CredentialsRetriever
+	serviceName                string
+	done                       bool
+	listener                   net.Listener
+	logger                     log.Logger
+	keyring                    agent.Agent
+	retrieveCredentials        internal.CredentialsRetriever
+	retrieveCredentialsContext internal.ContextCredentialsRetriever
 }
 
 // NewProxyService constructs a new instance of a SSH Agent ProxyService. The
@@ -38,15 +57,25 @@ func NewProxyService(
 	logger log.Logger,
 	retrieveCredentials internal.CredentialsRetriever,
 ) (internal.Service, error) {
+	return NewProxyServiceWithOptions(ProxyServiceOptions{
+		Listener:            listener,
+		Logger:              logger,
+		RetrieveCredentials: retrieveCredentials,
+	})
+}
+
+// NewProxyServiceWithOptions constructs an SSH Agent ProxyService with optional
+// telemetry metadata and context-aware credential retrieval.
+func NewProxyServiceWithOptions(opts ProxyServiceOptions) (internal.Service, error) {
 	errors := validation.Errors{}
 
-	if retrieveCredentials == nil {
+	if opts.RetrieveCredentials == nil && opts.RetrieveCredentialsContext == nil {
 		errors["retrieveCredentials"] = fmt.Errorf("retrieveCredentials cannot be nil")
 	}
-	if logger == nil {
+	if opts.Logger == nil {
 		errors["logger"] = fmt.Errorf("logger cannot be nil")
 	}
-	if listener == nil {
+	if opts.Listener == nil {
 		errors["listener"] = fmt.Errorf("listener cannot be nil")
 	}
 
@@ -54,13 +83,30 @@ func NewProxyService(
 		return nil, err
 	}
 
+	serviceName := opts.ServiceName
+	if serviceName == "" {
+		serviceName = opts.Logger.Prefix()
+	}
+	if serviceName == "" {
+		serviceName = "ssh-agent"
+	}
+
 	return &proxyService{
-		retrieveCredentials: retrieveCredentials,
-		listener:            listener,
-		logger:              logger,
-		done:                false,
-		keyring:             agent.NewKeyring(),
+		serviceName:                serviceName,
+		retrieveCredentials:        opts.RetrieveCredentials,
+		retrieveCredentialsContext: opts.RetrieveCredentialsContext,
+		listener:                   opts.Listener,
+		logger:                     opts.Logger,
+		done:                       false,
+		keyring:                    agent.NewKeyring(),
 	}, nil
+}
+
+func (proxy *proxyService) fetchCredentials(ctx context.Context) (map[string][]byte, error) {
+	if proxy.retrieveCredentialsContext != nil {
+		return proxy.retrieveCredentialsContext(ctx)
+	}
+	return proxy.retrieveCredentials()
 }
 
 func newPrivateKey(pemStr []byte) (interface{}, error) {
@@ -134,11 +180,24 @@ func (proxy *proxyService) Start() error {
 
 	// TODO: this proxy service only fetches credentials at the outset
 	//   so can not cope with rotation
-	backendCredentials, err := proxy.retrieveCredentials()
+	tracer := telemetry.Tracer(sshAgentTelemetryScope)
+	credCtx, credSpan := tracer.Start(
+		context.Background(),
+		"secretless.credentials.resolve",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("secretless.service.name", proxy.serviceName),
+			attribute.String("secretless.connector.id", "ssh-agent"),
+		),
+	)
+	backendCredentials, err := proxy.fetchCredentials(credCtx)
 	defer internal.ZeroizeCredentials(backendCredentials)
 	if err != nil {
+		credSpan.SetStatus(codes.Error, "credential retrieval failed")
+		credSpan.End()
 		return fmt.Errorf("failed on retrieve credentials: %s", err)
 	}
+	credSpan.End()
 
 	err = proxy.populateKeyring(backendCredentials)
 	if err != nil {
@@ -154,9 +213,29 @@ func (proxy *proxyService) Start() error {
 			}
 
 			go func() {
+				start := time.Now()
+				ctx, span := tracer.Start(
+					context.Background(),
+					"secretless.ssh_agent.connection",
+					trace.WithSpanKind(trace.SpanKindServer),
+					trace.WithAttributes(
+						attribute.String("secretless.service.name", proxy.serviceName),
+						attribute.String("secretless.connector.id", "ssh-agent"),
+					),
+				)
+				telemetry.AddSSHActiveConnection(ctx, proxy.serviceName, "ssh-agent", 1)
+				outcome := "ok"
+				defer func() {
+					telemetry.AddSSHActiveConnection(ctx, proxy.serviceName, "ssh-agent", -1)
+					telemetry.RecordSSHConnection(ctx, proxy.serviceName, "ssh-agent", outcome, time.Since(start))
+					span.End()
+				}()
+
 				proxy.logger.Debugf("Serving SSH Agent connection on %v", conn.LocalAddr())
 				err := agent.ServeAgent(proxy.keyring, conn)
 				if err != nil && err != io.EOF {
+					outcome = "error"
+					span.SetStatus(codes.Error, "ssh agent serve failed")
 					logger.Errorf("Failed on handle connection: %s", err)
 					return
 				}
